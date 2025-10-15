@@ -1,0 +1,6 @@
+pandas==2.2.2
+pyarrow==17.0.0
+numpy==2.1.1
+scikit-learn==1.5.2
+rapidfuzz==3.9.7
+python-slugify==8.0.4
