@@ -10,6 +10,9 @@ from recs.evaluate import loo_eval_per_field, loo_eval_rowwise
 from recs.text import fit_tfidf, nearest_neighbors, neighbor_token_scores
 from recs.hybrid import blend_with_attribution
 from recs.legal import legality_penalties, apply_penalties, remove_duplicates
+from recs.tune import sample_simplex, save_weights, load_weights
+WEIGHTS_FILE = Path("processed/hybrid_item_weights.json")
+TUNE_TRIALS  = 120
 
 MECH = Path("processed/mechanical.parquet")
 NARR = Path("processed/narrative.parquet")
@@ -55,6 +58,21 @@ def eval_field(name: str, mech: pd.DataFrame, X, narr_df: pd.DataFrame):
     pop_list = topn_popularity(train_sets, n=300)
     cooc     = build_cooccurrence(train_sets)
 
+    def tune_weights_for_field():
+        best = (-1.0, (0.5, 0.4, 0.1))  # (recall, weights)
+        # sample candidates (mix deterministic grid + random dirichlet)
+        cand = sample_simplex(n=3, num=TUNE_TRIALS, kind="dirichlet") + sample_simplex(n=3, num=0, kind="grid")
+        for w in cand:
+            rec_hyb = make_rec_hybrid_for_row(w)
+            def wrapper(rid: int, known: set, k=5):
+                items, _ = rec_hyb(rid, k=k, _known_override=known)
+                return items
+            r_hyb, m_hyb, n_hyb = loo_eval_rowwise(sets, wrapper, k=5)
+            if r_hyb > best[0]:
+                best = (r_hyb, w)
+        return best  # (best_recall, (w_i, w_n, w_p))
+
+
     def rec_pop(known, k=5): 
         return recommend_popularity(pop_list, known, k)
 
@@ -67,54 +85,69 @@ def eval_field(name: str, mech: pd.DataFrame, X, narr_df: pd.DataFrame):
     # Hybrid recommender: itemknn + narrative neighbors + popularity (+ legality)
     token_series = series  # feats/weapons/armor lists per row
 
-    def rec_hybrid_for_row(row_id: int, k=5, _known_override=None):
-        known = sets[row_id] if _known_override is None else _known_override
-        known = {str(x) for x in known}  # normalize to strings
-        # 1) itemknn scores
-        itemknn_scores = Counter({str(it): 1.0 for it in rec_itemknn(known, k=80)}) if known else Counter()
-        if known:
-            for it in rec_itemknn(known, k=80):  # get a candidate pool
-                itemknn_scores[it] += 1.0
-        # 2) narrative neighbor scores
-        neigh = nearest_neighbors(X, row_id, topn=35)
-        neigh_scores = {str(t): float(w) for t, w in neighbor_token_scores(neigh, token_series, exclude=known).items()}
-        # give a tiny positive prior to *every* item we've ever seen so the target can be ranked
-        # normalized by max count to keep it small
-        maxc = max(global_counts.values()) if global_counts else 1
-        pop_scores = {it: global_counts[it] / maxc for it in global_vocab}
+    def make_rec_hybrid_for_row(weights_tuple):
+        # unpack & freeze the weights
+        w_i, w_n, w_p = map(float, weights_tuple)
 
-        # Blend with attribution
-        parts   = [itemknn_scores, neigh_scores, pop_scores]
-        w_i, w_n, w_p = weights_for(name)
-        weights = [w_i, w_n, w_p]
-        blended, contribs = blend_with_attribution(parts, weights)
+        def _rec(row_id: int, k=5, _known_override=None, _w_i=w_i, _w_n=w_n, _w_p=w_p):
+            known = sets[row_id] if _known_override is None else _known_override
+            known = {str(x) for x in known}
 
-        # remove duplicates and apply legality nudges
-        primary = str(mech.loc[row_id, "primary_class"]) if pd.notna(mech.loc[row_id, "primary_class"]) else None
-        blended = remove_duplicates(blended, owned=known)
-        pen_map = legality_penalties(primary, list(blended.keys()))
-        blended = apply_penalties(blended, pen_map)
+            # 1) itemknn pool
+            itemknn_scores = Counter()
+            if known:
+                for it in rec_itemknn(known, k=80):
+                    itemknn_scores[str(it)] += 1.0
 
-        # convert to ranked list
-        ranked = sorted(blended.items(), key=lambda x: x[1], reverse=True)
-        topk = ranked[:k]
+            # 2) narrative neighbors
+            neigh = nearest_neighbors(X, row_id, topn=35)
+            neigh_scores = neighbor_token_scores(neigh, token_series, exclude=known)
+            neigh_scores = {str(t): float(w) for t, w in neigh_scores.items()}
 
-        # build explanations for top-k
-        details = []
-        for item, score in topk:
-            c = contribs.get(item, {})
-            details.append({
-                "item": item,
-                "score": float(score),
-                "from_itemknn": float(c.get("part_0", 0.0)),
-                "from_narrative": float(c.get("part_1", 0.0)),
-                "from_pop": float(c.get("part_2", 0.0)),
-                "penalty": float(pen_map.get(item, 0.0)),
-                "primary_class": primary
-            })
+            # 3) global prior over ALL tokens
+            maxc = max(global_counts.values()) if global_counts else 1
+            pop_scores = {str(it): global_counts[it] / maxc for it in global_vocab}
 
-        return [it for it, _ in topk], details
+            # blend with attribution (use captured weights)
+            parts = [itemknn_scores, neigh_scores, pop_scores]
+            blended, contribs = blend_with_attribution(parts, [_w_i, _w_n, _w_p])
 
+            # legality
+            primary = str(mech.loc[row_id, "primary_class"]) if pd.notna(mech.loc[row_id, "primary_class"]) else None
+            blended = remove_duplicates(blended, owned=known)
+            pen_map = {} if name == "feats" else legality_penalties(primary, list(blended.keys()))
+            blended = apply_penalties(blended, pen_map)
+
+            ranked = sorted(blended.items(), key=lambda x: x[1], reverse=True)
+            topk = ranked[:k]
+
+            details = []
+            for item, score in topk:
+                c = contribs.get(item, {})
+                details.append({
+                    "item": item,
+                    "score": float(score),
+                    "from_itemknn": float(c.get("part_0", 0.0)),
+                    "from_narrative": float(c.get("part_1", 0.0)),
+                    "from_pop": float(c.get("part_2", 0.0)),
+                    "penalty": float(pen_map.get(item, 0.0)),
+                    "primary_class": primary
+                })
+            return [it for it, _ in topk], details
+
+        return _rec
+
+
+    saved = load_weights(WEIGHTS_FILE, {})
+    field_key = f"item::{name}"
+    if field_key in saved:
+        best_w = tuple(saved[field_key])
+    else:
+        best_score, best_w = tune_weights_for_field()
+        saved[field_key] = list(best_w)
+        save_weights(WEIGHTS_FILE, saved)
+
+    rec_hybrid_for_row = make_rec_hybrid_for_row(best_w)
 
     # Evaluate baselines + hybrid (row-aware)
     print(f"[{name}] rows={len(sets)} nonempty={sum(1 for s in sets if s)} avg_len={sum(len(s) for s in sets)/max(1,len(sets)):.2f}")
@@ -125,12 +158,10 @@ def eval_field(name: str, mech: pd.DataFrame, X, narr_df: pd.DataFrame):
 
     # Row-aware hybrid eval: when we hide the target, we must pass that reduced known set
     def rec_hybrid_rowaware(rid: int, known: set, k=5):
-        ret = rec_hybrid_for_row(rid, k=k, _known_override=known)
-        items = ret[0] if isinstance(ret, tuple) else ret
+        items, _ = rec_hybrid_for_row(rid, k=k, _known_override=known)
         return items
-
     r_hyb, m_hyb, n_hyb = loo_eval_rowwise(sets, rec_hybrid_rowaware, k=5)
-    print(f"{'':8}    Hybrid  R@5:{r_hyb:.3f} MRR@5:{m_hyb:.3f} (n={n_hyb})")
+    print(f"{'':8}    Hybrid* R@5:{r_hyb:.3f} MRR@5:{m_hyb:.3f} (n={n_hyb})  w={tuple(round(x,2) for x in best_w)}")
 
     return rec_hybrid_for_row
 
